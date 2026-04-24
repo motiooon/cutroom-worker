@@ -1,15 +1,14 @@
 // Cutroom FFmpeg worker — deploy on Render or Railway.
 // Required ENV:
-//   PORT                       (Render sets automatically)
+//   PORT                       (Render/Railway sets automatically)
 //   SUPABASE_URL               (from Lovable Cloud → Project settings)
 //   SUPABASE_SERVICE_ROLE_KEY  (from Lovable Cloud → Project settings, server-only!)
 //   WORKER_SECRET              (optional shared secret — match VIDEO_WORKER_SECRET in your app)
 //
 // Endpoints:
+//   POST /extract-audio   { inputUrl, uploadBucket, uploadPath }
 //   POST /render-cleaned  { projectId, inputUrl, keeps:[{start,end}], uploadBucket, uploadPath }
 //   POST /render-clip     { clipId, inputUrl, start, end, uploadBucket, uploadPath }
-//
-// Render: New Web Service → Docker (use Node 20) → these env vars → command `npm start`
 
 import express from "express";
 import ffmpeg from "fluent-ffmpeg";
@@ -17,7 +16,6 @@ import { createClient } from "@supabase/supabase-js";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
 
 const app = express();
 app.use(express.json({ limit: "5mb" }));
@@ -82,6 +80,45 @@ function concatFiles(listFile, output) {
   });
 }
 
+// Extract compressed mono 16kHz MP3 — small enough for Whisper's 25MB limit
+function ffmpegExtractAudio(input, output) {
+  return new Promise((resolve, reject) => {
+    ffmpeg(input)
+      .noVideo()
+      .audioCodec("libmp3lame")
+      .audioChannels(1)
+      .audioFrequency(16000)
+      .audioBitrate("64k")
+      .output(output)
+      .on("end", resolve)
+      .on("error", reject)
+      .run();
+  });
+}
+
+app.post("/extract-audio", async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  const { inputUrl, uploadBucket, uploadPath } = req.body ?? {};
+  if (!inputUrl || !uploadBucket || !uploadPath)
+    return res.status(400).json({ error: "missing inputUrl/uploadBucket/uploadPath" });
+
+  const work = await fs.mkdtemp(path.join(os.tmpdir(), "cutroom-audio-"));
+  try {
+    const src = path.join(work, "src");
+    await downloadTo(inputUrl, src);
+    const out = path.join(work, "audio.mp3");
+    await ffmpegExtractAudio(src, out);
+    const stat = await fs.stat(out);
+    const url = await uploadFile(uploadBucket, uploadPath, out, "audio/mpeg");
+    res.json({ ok: true, url, path: uploadPath, sizeBytes: stat.size });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: String(e?.message ?? e) });
+  } finally {
+    await fs.rm(work, { recursive: true, force: true });
+  }
+});
+
 app.post("/render-cleaned", async (req, res) => {
   if (!checkAuth(req, res)) return;
   const { projectId, inputUrl, keeps, uploadBucket, uploadPath } = req.body ?? {};
@@ -135,7 +172,7 @@ app.post("/render-clip", async (req, res) => {
   }
 });
 
-app.get("/", (_req, res) => res.json({ ok: true, name: "cutroom-worker" }));
+app.get("/", (_req, res) => res.json({ ok: true, name: "cutroom-worker", version: 2 }));
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`cutroom-worker listening on :${port}`));
